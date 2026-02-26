@@ -122,7 +122,6 @@ function mapToErrorCode(error, options = {}) {
       }
     }
   }
-
   // 按错误 code 匹配（网络错误）
   if (errorCode) {
     const codeStr = String(errorCode).toUpperCase()
@@ -138,9 +137,15 @@ function mapToErrorCode(error, options = {}) {
   }
 
   const result = ERROR_CODES[matchedCode]
+  let errorMessage = originalMessage
+  if (matchedCode === 'E015' && originalMessage !== '') {
+    errorMessage = originalMessage
+  } else {
+    errorMessage = result.message
+  }
   return {
     code: matchedCode,
-    message: result.message,
+    message: errorMessage,
     status: result.status
   }
 }
