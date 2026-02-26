@@ -138,9 +138,7 @@ function mapToErrorCode(error, options = {}) {
 
   const result = ERROR_CODES[matchedCode]
   let errorMessage = originalMessage
-  if (matchedCode === 'E015' && originalMessage !== '') {
-    errorMessage = originalMessage
-  } else {
+  if (errorMessage === '') {
     errorMessage = result.message
   }
   return {
