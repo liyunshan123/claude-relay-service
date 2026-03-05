@@ -4,7 +4,6 @@
  */
 
 const CLAUDE_MODELS = [
-  { value: 'claude-sonnet-4-6', label: 'Claude Sonnet 4.6' },
   { value: 'claude-sonnet-4-6-thinking', label: 'Claude Sonnet 4.6 Thinking' },
   { value: 'claude-opus-4-6', label: 'Claude Opus 4.6' },
   { value: 'claude-sonnet-4-6', label: 'Claude Sonnet 4.6' },
