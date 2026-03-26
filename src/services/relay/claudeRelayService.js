@@ -19,6 +19,12 @@ const { isStreamWritable } = require('../../utils/streamHelper')
 const upstreamErrorHelper = require('../../utils/upstreamErrorHelper')
 const metadataUserIdHelper = require('../../utils/metadataUserIdHelper')
 const {
+  createAnthropicUsageCollector,
+  consumeAnthropicSseLine,
+  finalizeAnthropicUsageCollector,
+  summarizeAnthropicUsageCollector
+} = require('../../utils/anthropicUsageCollector')
+const {
   getHttpsAgentForStream,
   getHttpsAgentForNonStream,
   getPricingData
@@ -195,9 +201,13 @@ class ClaudeRelayService {
   // Anthropic 对未开启 Extra Usage 的账户请求长上下文模型时返回此错误
   // 这不是真正的限流，不应标记账户为 rate limited
   _isExtraUsageRequired429(statusCode, body) {
-    if (statusCode !== 429) return false
+    if (statusCode !== 429) {
+      return false
+    }
     const message = this._extractErrorMessage(body)
-    if (!message) return false
+    if (!message) {
+      return false
+    }
     return message.toLowerCase().includes('extra usage')
   }
 
@@ -2497,8 +2507,6 @@ class ClaudeRelayService {
         }
 
         let buffer = ''
-        const allUsageData = [] // 收集所有的usage事件
-        let currentUsageData = {} // 当前正在收集的usage数据
         let rateLimitDetected = false // 限流检测标志
 
         // 监听数据块，解析SSE并寻找usage信息
@@ -2506,6 +2514,28 @@ class ClaudeRelayService {
         // body 和 requestOptions 只在闭包外使用，闭包内只引用基本类型
         const requestedModel = body?.model || 'unknown'
         const { isRealClaudeCodeRequest } = requestOptions
+        const usageCollector = createAnthropicUsageCollector(requestedModel)
+
+        const processUsageLines = (lines) => {
+          for (const line of lines) {
+            try {
+              const data = consumeAnthropicSseLine(usageCollector, line, logger, 'Official')
+
+              if (
+                data &&
+                data.type === 'error' &&
+                data.error &&
+                data.error.message &&
+                data.error.message.toLowerCase().includes("exceed your account's rate limit")
+              ) {
+                rateLimitDetected = true
+                logger.warn(`🚫 Rate limit detected in stream for account ${accountId}`)
+              }
+            } catch (parseError) {
+              logger.debug('🔍 SSE line not JSON or no usage data:', line.slice(0, 100))
+            }
+          }
+        }
 
         // 🔧 处理上游 gzip/deflate 压缩：Anthropic (经 Cloudflare) 可能返回压缩响应
         const upstreamEncoding = res.headers['content-encoding']
@@ -2559,104 +2589,7 @@ class ClaudeRelayService {
               }
             }
 
-            for (const line of lines) {
-              // 解析SSE数据寻找usage信息
-              if (line.startsWith('data:')) {
-                const jsonStr = line.slice(5).trimStart()
-                if (!jsonStr || jsonStr === '[DONE]') {
-                  continue
-                }
-                try {
-                  const data = JSON.parse(jsonStr)
-
-                  // 收集来自不同事件的usage数据
-                  if (data.type === 'message_start' && data.message && data.message.usage) {
-                    // 新的消息开始，如果之前有数据，先保存
-                    if (
-                      currentUsageData.input_tokens !== undefined &&
-                      currentUsageData.output_tokens !== undefined
-                    ) {
-                      allUsageData.push({ ...currentUsageData })
-                      currentUsageData = {}
-                    }
-
-                    // message_start包含input tokens、cache tokens和模型信息
-                    currentUsageData.input_tokens = data.message.usage.input_tokens || 0
-                    currentUsageData.cache_creation_input_tokens =
-                      data.message.usage.cache_creation_input_tokens || 0
-                    currentUsageData.cache_read_input_tokens =
-                      data.message.usage.cache_read_input_tokens || 0
-                    currentUsageData.model = data.message.model
-
-                    // 检查是否有详细的 cache_creation 对象
-                    if (
-                      data.message.usage.cache_creation &&
-                      typeof data.message.usage.cache_creation === 'object'
-                    ) {
-                      currentUsageData.cache_creation = {
-                        ephemeral_5m_input_tokens:
-                          data.message.usage.cache_creation.ephemeral_5m_input_tokens || 0,
-                        ephemeral_1h_input_tokens:
-                          data.message.usage.cache_creation.ephemeral_1h_input_tokens || 0
-                      }
-                      logger.debug(
-                        '📊 Collected detailed cache creation data:',
-                        JSON.stringify(currentUsageData.cache_creation)
-                      )
-                    }
-
-                    logger.debug(
-                      '📊 Collected input/cache data from message_start:',
-                      JSON.stringify(currentUsageData)
-                    )
-                  }
-
-                  // message_delta包含最终的output tokens
-                  if (
-                    data.type === 'message_delta' &&
-                    data.usage &&
-                    data.usage.output_tokens !== undefined
-                  ) {
-                    currentUsageData.output_tokens = data.usage.output_tokens || 0
-
-                    logger.debug(
-                      '📊 Collected output data from message_delta:',
-                      JSON.stringify(currentUsageData)
-                    )
-
-                    // 如果已经收集到了input数据和output数据，这是一个完整的usage
-                    if (currentUsageData.input_tokens !== undefined) {
-                      logger.debug(
-                        '🎯 Complete usage data collected for model:',
-                        currentUsageData.model,
-                        '- Input:',
-                        currentUsageData.input_tokens,
-                        'Output:',
-                        currentUsageData.output_tokens
-                      )
-                      // 保存到列表中，但不立即触发回调
-                      allUsageData.push({ ...currentUsageData })
-                      // 重置当前数据，准备接收下一个
-                      currentUsageData = {}
-                    }
-                  }
-
-                  // 检查是否有限流错误
-                  if (
-                    data.type === 'error' &&
-                    data.error &&
-                    data.error.message &&
-                    data.error.message.toLowerCase().includes("exceed your account's rate limit")
-                  ) {
-                    rateLimitDetected = true
-                    logger.warn(`🚫 Rate limit detected in stream for account ${accountId}`)
-                  }
-                } catch (parseError) {
-                  // 忽略JSON解析错误，继续处理
-                  logger.debug('🔍 SSE line not JSON or no usage data:', line.slice(0, 100))
-                }
-              }
-            }
+            processUsageLines(lines)
           } catch (error) {
             logger.error('❌ Error processing stream data:', error)
             // 发送错误但不破坏流，让它自然结束
@@ -2676,14 +2609,18 @@ class ClaudeRelayService {
         dataSource.on('end', async () => {
           try {
             // 处理缓冲区中剩余的数据
-            if (buffer.trim() && isStreamWritable(responseStream)) {
-              if (toolNameStreamTransformer) {
-                const transformed = toolNameStreamTransformer(buffer)
-                if (transformed) {
-                  responseStream.write(transformed)
+            if (buffer.trim()) {
+              processUsageLines(buffer.split('\n'))
+
+              if (isStreamWritable(responseStream)) {
+                if (toolNameStreamTransformer) {
+                  const transformed = toolNameStreamTransformer(buffer)
+                  if (transformed) {
+                    responseStream.write(transformed)
+                  }
+                } else {
+                  responseStream.write(buffer)
                 }
-              } else {
-                responseStream.write(buffer)
               }
             }
 
@@ -2703,73 +2640,35 @@ class ClaudeRelayService {
             logger.error('❌ Error processing stream end:', error)
           }
 
-          // 如果还有未完成的usage数据，尝试保存
-          if (currentUsageData.input_tokens !== undefined) {
-            if (currentUsageData.output_tokens === undefined) {
-              currentUsageData.output_tokens = 0 // 如果没有output，设为0
-            }
-            allUsageData.push(currentUsageData)
-          }
+          finalizeAnthropicUsageCollector(usageCollector, logger, 'Official', 'stream_end')
+          const usageEntries = usageCollector.entries
 
           // 检查是否捕获到usage数据
-          if (allUsageData.length === 0) {
+          if (usageEntries.length === 0) {
             logger.warn(
               '⚠️ Stream completed but no usage data was captured! This indicates a problem with SSE parsing or Claude API response format.'
             )
           } else {
-            // 打印此次请求的所有usage数据汇总
-            const totalUsage = allUsageData.reduce(
-              (acc, usage) => ({
-                input_tokens: (acc.input_tokens || 0) + (usage.input_tokens || 0),
-                output_tokens: (acc.output_tokens || 0) + (usage.output_tokens || 0),
-                cache_creation_input_tokens:
-                  (acc.cache_creation_input_tokens || 0) + (usage.cache_creation_input_tokens || 0),
-                cache_read_input_tokens:
-                  (acc.cache_read_input_tokens || 0) + (usage.cache_read_input_tokens || 0),
-                models: [...(acc.models || []), usage.model].filter(Boolean)
-              }),
-              {}
-            )
-
             // 打印原始的usage数据为JSON字符串，避免嵌套问题
             logger.info(
-              `📊 === Stream Request Usage Summary === Model: ${requestedModel}, Total Events: ${allUsageData.length}, Usage Data: ${JSON.stringify(allUsageData)}`
+              `📊 === Stream Request Usage Summary === Model: ${requestedModel}, Total Events: ${usageEntries.length}, Usage Data: ${JSON.stringify(usageEntries)}`
             )
 
-            // 一般一个请求只会使用一个模型，即使有多个usage事件也应该合并
-            // 计算总的usage
-            const finalUsage = {
-              input_tokens: totalUsage.input_tokens,
-              output_tokens: totalUsage.output_tokens,
-              cache_creation_input_tokens: totalUsage.cache_creation_input_tokens,
-              cache_read_input_tokens: totalUsage.cache_read_input_tokens,
-              model: allUsageData[allUsageData.length - 1].model || requestedModel // 使用最后一个模型或请求模型
-            }
+            const finalUsage = summarizeAnthropicUsageCollector(usageCollector, requestedModel)
 
-            // 如果有详细的cache_creation数据，合并它们
-            let totalEphemeral5m = 0
-            let totalEphemeral1h = 0
-            allUsageData.forEach((usage) => {
-              if (usage.cache_creation && typeof usage.cache_creation === 'object') {
-                totalEphemeral5m += usage.cache_creation.ephemeral_5m_input_tokens || 0
-                totalEphemeral1h += usage.cache_creation.ephemeral_1h_input_tokens || 0
-              }
-            })
-
-            // 如果有详细的缓存数据，添加到finalUsage
-            if (totalEphemeral5m > 0 || totalEphemeral1h > 0) {
-              finalUsage.cache_creation = {
-                ephemeral_5m_input_tokens: totalEphemeral5m,
-                ephemeral_1h_input_tokens: totalEphemeral1h
-              }
+            // 调用一次usageCallback记录合并后的数据
+            if (
+              finalUsage &&
+              finalUsage.cache_creation &&
+              typeof finalUsage.cache_creation === 'object'
+            ) {
               logger.info(
                 '📊 Detailed cache creation breakdown:',
                 JSON.stringify(finalUsage.cache_creation)
               )
             }
 
-            // 调用一次usageCallback记录合并后的数据
-            if (usageCallback && typeof usageCallback === 'function') {
+            if (finalUsage && usageCallback && typeof usageCallback === 'function') {
               usageCallback(finalUsage)
             }
           }

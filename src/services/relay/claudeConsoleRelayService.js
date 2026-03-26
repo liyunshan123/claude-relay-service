@@ -13,6 +13,12 @@ const upstreamErrorHelper = require('../../utils/upstreamErrorHelper')
 const userMessageQueueService = require('../userMessageQueueService')
 const { isStreamWritable } = require('../../utils/streamHelper')
 const { filterForClaude } = require('../../utils/headerFilter')
+const {
+  createAnthropicUsageCollector,
+  consumeAnthropicSseLine,
+  finalizeAnthropicUsageCollector,
+  summarizeAnthropicUsageCollector
+} = require('../../utils/anthropicUsageCollector')
 
 class ClaudeConsoleRelayService {
   constructor() {
@@ -994,9 +1000,23 @@ class ClaudeConsoleRelayService {
           }
 
           let buffer = ''
-          let finalUsageReported = false
-          const collectedUsageData = {
-            model: body.model || account?.defaultModel || null
+          const requestedModel = body.model || account?.defaultModel || null
+          const usageCollector = createAnthropicUsageCollector(requestedModel)
+
+          const processUsageLines = (lines) => {
+            for (const line of lines) {
+              try {
+                const data = consumeAnthropicSseLine(usageCollector, line, logger, 'Console')
+                if (data && data.type === 'message_delta' && (data.usage || data.delta?.usage)) {
+                  logger.info(
+                    '📊 [Console] Collected usage data from message_delta:',
+                    JSON.stringify(usageCollector.current)
+                  )
+                }
+              } catch (_) {
+                //
+              }
+            }
           }
 
           // 处理流数据
@@ -1041,107 +1061,7 @@ class ClaudeConsoleRelayService {
                 }
 
                 // 解析SSE数据寻找usage信息（无论连接状态如何）
-                for (const line of lines) {
-                  if (line.startsWith('data:')) {
-                    const jsonStr = line.slice(5).trimStart()
-                    if (!jsonStr || jsonStr === '[DONE]') {
-                      continue
-                    }
-                    try {
-                      const data = JSON.parse(jsonStr)
-
-                      // 收集usage数据
-                      if (data.type === 'message_start' && data.message && data.message.usage) {
-                        collectedUsageData.input_tokens = data.message.usage.input_tokens || 0
-                        collectedUsageData.cache_creation_input_tokens =
-                          data.message.usage.cache_creation_input_tokens || 0
-                        collectedUsageData.cache_read_input_tokens =
-                          data.message.usage.cache_read_input_tokens || 0
-                        collectedUsageData.model = data.message.model
-
-                        // 检查是否有详细的 cache_creation 对象
-                        if (
-                          data.message.usage.cache_creation &&
-                          typeof data.message.usage.cache_creation === 'object'
-                        ) {
-                          collectedUsageData.cache_creation = {
-                            ephemeral_5m_input_tokens:
-                              data.message.usage.cache_creation.ephemeral_5m_input_tokens || 0,
-                            ephemeral_1h_input_tokens:
-                              data.message.usage.cache_creation.ephemeral_1h_input_tokens || 0
-                          }
-                          logger.info(
-                            '📊 Collected detailed cache creation data:',
-                            JSON.stringify(collectedUsageData.cache_creation)
-                          )
-                        }
-                      }
-
-                      if (data.type === 'message_delta' && data.usage) {
-                        // 提取所有usage字段，message_delta可能包含完整的usage信息
-                        if (data.usage.output_tokens !== undefined) {
-                          collectedUsageData.output_tokens = data.usage.output_tokens || 0
-                        }
-
-                        // 提取input_tokens（如果存在）
-                        if (data.usage.input_tokens !== undefined) {
-                          collectedUsageData.input_tokens = data.usage.input_tokens || 0
-                        }
-
-                        // 提取cache相关的tokens
-                        if (data.usage.cache_creation_input_tokens !== undefined) {
-                          collectedUsageData.cache_creation_input_tokens =
-                            data.usage.cache_creation_input_tokens || 0
-                        }
-                        if (data.usage.cache_read_input_tokens !== undefined) {
-                          collectedUsageData.cache_read_input_tokens =
-                            data.usage.cache_read_input_tokens || 0
-                        }
-
-                        // 检查是否有详细的 cache_creation 对象
-                        if (
-                          data.usage.cache_creation &&
-                          typeof data.usage.cache_creation === 'object'
-                        ) {
-                          collectedUsageData.cache_creation = {
-                            ephemeral_5m_input_tokens:
-                              data.usage.cache_creation.ephemeral_5m_input_tokens || 0,
-                            ephemeral_1h_input_tokens:
-                              data.usage.cache_creation.ephemeral_1h_input_tokens || 0
-                          }
-                        }
-
-                        logger.info(
-                          '📊 [Console] Collected usage data from message_delta:',
-                          JSON.stringify(collectedUsageData)
-                        )
-
-                        // 如果已经收集到了完整数据，触发回调
-                        if (
-                          collectedUsageData.input_tokens !== undefined &&
-                          collectedUsageData.output_tokens !== undefined &&
-                          !finalUsageReported
-                        ) {
-                          if (!collectedUsageData.model) {
-                            collectedUsageData.model = body.model || account?.defaultModel || null
-                          }
-                          logger.info(
-                            '🎯 [Console] Complete usage data collected:',
-                            JSON.stringify(collectedUsageData)
-                          )
-                          if (usageCallback && typeof usageCallback === 'function') {
-                            usageCallback({ ...collectedUsageData, accountId })
-                          }
-                          finalUsageReported = true
-                        }
-                      }
-
-                      // 不再因为模型不支持而block账号
-                    } catch (e) {
-                      // 忽略解析错误
-                    }
-                  }
-                }
+                processUsageLines(lines)
               }
             } catch (error) {
               logger.error(
@@ -1171,52 +1091,36 @@ class ClaudeConsoleRelayService {
           response.data.on('end', () => {
             try {
               // 处理缓冲区中剩余的数据
-              if (buffer.trim() && isStreamWritable(responseStream)) {
-                if (streamTransformer) {
-                  const transformed = streamTransformer(buffer)
-                  if (transformed) {
-                    responseStream.write(transformed)
+              if (buffer.trim()) {
+                processUsageLines(buffer.split('\n'))
+
+                if (isStreamWritable(responseStream)) {
+                  if (streamTransformer) {
+                    const transformed = streamTransformer(buffer)
+                    if (transformed) {
+                      responseStream.write(transformed)
+                    }
+                  } else {
+                    responseStream.write(buffer)
                   }
-                } else {
-                  responseStream.write(buffer)
                 }
               }
 
-              // 🔧 兜底逻辑：确保所有未保存的usage数据都不会丢失
-              if (!finalUsageReported) {
-                if (
-                  collectedUsageData.input_tokens !== undefined ||
-                  collectedUsageData.output_tokens !== undefined
-                ) {
-                  // 补全缺失的字段
-                  if (collectedUsageData.input_tokens === undefined) {
-                    collectedUsageData.input_tokens = 0
-                    logger.warn(
-                      '⚠️ [Console] message_delta missing input_tokens, setting to 0. This may indicate incomplete usage data.'
-                    )
-                  }
-                  if (collectedUsageData.output_tokens === undefined) {
-                    collectedUsageData.output_tokens = 0
-                    logger.warn(
-                      '⚠️ [Console] message_delta missing output_tokens, setting to 0. This may indicate incomplete usage data.'
-                    )
-                  }
-                  // 确保有 model 字段
-                  if (!collectedUsageData.model) {
-                    collectedUsageData.model = body.model || account?.defaultModel || null
-                  }
-                  logger.info(
-                    `📊 [Console] Saving incomplete usage data via fallback: ${JSON.stringify(collectedUsageData)}`
-                  )
-                  if (usageCallback && typeof usageCallback === 'function') {
-                    usageCallback({ ...collectedUsageData, accountId })
-                  }
-                  finalUsageReported = true
-                } else {
-                  logger.warn(
-                    '⚠️ [Console] Stream completed but no usage data was captured! This indicates a problem with SSE parsing or API response format.'
-                  )
+              finalizeAnthropicUsageCollector(usageCollector, logger, 'Console', 'stream_end')
+              const finalUsage = summarizeAnthropicUsageCollector(usageCollector, requestedModel)
+
+              if (finalUsage) {
+                logger.info(
+                  '🎯 [Console] Complete usage data collected:',
+                  JSON.stringify(finalUsage)
+                )
+                if (usageCallback && typeof usageCallback === 'function') {
+                  usageCallback({ ...finalUsage, accountId })
                 }
+              } else {
+                logger.warn(
+                  '⚠️ [Console] Stream completed but no usage data was captured! This indicates a problem with SSE parsing or API response format.'
+                )
               }
 
               // 确保流正确结束

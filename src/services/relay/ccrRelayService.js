@@ -6,6 +6,12 @@ const { parseVendorPrefixedModel } = require('../../utils/modelHelper')
 const userMessageQueueService = require('../userMessageQueueService')
 const { isStreamWritable } = require('../../utils/streamHelper')
 const upstreamErrorHelper = require('../../utils/upstreamErrorHelper')
+const {
+  createAnthropicUsageCollector,
+  consumeAnthropicSseLine,
+  finalizeAnthropicUsageCollector,
+  summarizeAnthropicUsageCollector
+} = require('../../utils/anthropicUsageCollector')
 
 class CcrRelayService {
   constructor() {
@@ -760,7 +766,38 @@ class CcrRelayService {
 
           // 处理流数据和使用统计收集
           let rawBuffer = ''
-          const collectedUsage = {}
+          const usageCollector = createAnthropicUsageCollector(body.model)
+
+          const processSseLines = (lines) => {
+            for (const line of lines) {
+              if (line.trim()) {
+                try {
+                  consumeAnthropicSseLine(usageCollector, line, logger, 'CCR')
+                } catch (_) {
+                  //
+                }
+
+                // 应用流转换器（如果提供）
+                let outputLine = line
+                if (streamTransformer && typeof streamTransformer === 'function') {
+                  outputLine = streamTransformer(line)
+                }
+
+                // 写入到响应流
+                if (outputLine && isStreamWritable(responseStream)) {
+                  responseStream.write(`${outputLine}\n`)
+                } else if (outputLine) {
+                  // 客户端连接已断开，记录警告
+                  logger.warn(
+                    `⚠️ [CCR] Client disconnected during stream, skipping data for account: ${accountId}`
+                  )
+                }
+              } else if (isStreamWritable(responseStream)) {
+                // 空行也需要传递
+                responseStream.write('\n')
+              }
+            }
+          }
 
           response.data.on('data', (chunk) => {
             if (aborted || responseStream.destroyed) {
@@ -775,48 +812,26 @@ class CcrRelayService {
               const lines = rawBuffer.split('\n')
               rawBuffer = lines.pop() // 保留最后一个可能不完整的行
 
-              for (const line of lines) {
-                if (line.trim()) {
-                  // 解析 SSE 数据并收集使用统计
-                  const usageData = this._parseSSELineForUsage(line)
-                  if (usageData) {
-                    Object.assign(collectedUsage, usageData)
-                  }
-
-                  // 应用流转换器（如果提供）
-                  let outputLine = line
-                  if (streamTransformer && typeof streamTransformer === 'function') {
-                    outputLine = streamTransformer(line)
-                  }
-
-                  // 写入到响应流
-                  if (outputLine && isStreamWritable(responseStream)) {
-                    responseStream.write(`${outputLine}\n`)
-                  } else if (outputLine) {
-                    // 客户端连接已断开，记录警告
-                    logger.warn(
-                      `⚠️ [CCR] Client disconnected during stream, skipping data for account: ${accountId}`
-                    )
-                  }
-                } else {
-                  // 空行也需要传递
-                  if (isStreamWritable(responseStream)) {
-                    responseStream.write('\n')
-                  }
-                }
-              }
+              processSseLines(lines)
             } catch (err) {
               logger.error('❌ Error processing SSE chunk:', err)
             }
           })
 
           response.data.on('end', () => {
+            if (rawBuffer.trim()) {
+              processSseLines(rawBuffer.split('\n'))
+            }
+
+            finalizeAnthropicUsageCollector(usageCollector, logger, 'CCR', 'stream_end')
+            const finalUsage = summarizeAnthropicUsageCollector(usageCollector, body.model)
+
             // 如果收集到使用统计数据，调用回调
-            if (usageCallback && Object.keys(collectedUsage).length > 0) {
+            if (usageCallback && finalUsage) {
               try {
-                logger.debug(`📊 Collected usage data: ${JSON.stringify(collectedUsage)}`)
+                logger.debug(`📊 Collected usage data: ${JSON.stringify(finalUsage)}`)
                 // 在 usage 回调中包含模型信息
-                usageCallback({ ...collectedUsage, accountId, model: body.model })
+                usageCallback({ ...finalUsage, accountId, model: finalUsage.model || body.model })
               } catch (err) {
                 logger.error('❌ Error in usage callback:', err)
               }
@@ -881,53 +896,6 @@ class CcrRelayService {
           reject(error)
         })
     })
-  }
-
-  // 📊 解析SSE行以提取使用统计信息
-  _parseSSELineForUsage(line) {
-    try {
-      if (line.startsWith('data: ')) {
-        const data = line.substring(6).trim()
-        if (data === '[DONE]') {
-          return null
-        }
-
-        const jsonData = JSON.parse(data)
-
-        // 检查是否包含使用统计信息
-        if (jsonData.usage) {
-          return {
-            input_tokens: jsonData.usage.input_tokens || 0,
-            output_tokens: jsonData.usage.output_tokens || 0,
-            cache_creation_input_tokens: jsonData.usage.cache_creation_input_tokens || 0,
-            cache_read_input_tokens: jsonData.usage.cache_read_input_tokens || 0,
-            // 支持 ephemeral cache 字段
-            cache_creation_input_tokens_ephemeral_5m:
-              jsonData.usage.cache_creation_input_tokens_ephemeral_5m || 0,
-            cache_creation_input_tokens_ephemeral_1h:
-              jsonData.usage.cache_creation_input_tokens_ephemeral_1h || 0
-          }
-        }
-
-        // 检查 message_delta 事件中的使用统计
-        if (jsonData.type === 'message_delta' && jsonData.delta && jsonData.delta.usage) {
-          return {
-            input_tokens: jsonData.delta.usage.input_tokens || 0,
-            output_tokens: jsonData.delta.usage.output_tokens || 0,
-            cache_creation_input_tokens: jsonData.delta.usage.cache_creation_input_tokens || 0,
-            cache_read_input_tokens: jsonData.delta.usage.cache_read_input_tokens || 0,
-            cache_creation_input_tokens_ephemeral_5m:
-              jsonData.delta.usage.cache_creation_input_tokens_ephemeral_5m || 0,
-            cache_creation_input_tokens_ephemeral_1h:
-              jsonData.delta.usage.cache_creation_input_tokens_ephemeral_1h || 0
-          }
-        }
-      }
-    } catch (err) {
-      // 忽略解析错误，不是所有行都包含 JSON
-    }
-
-    return null
   }
 
   // 🔍 过滤客户端请求头
