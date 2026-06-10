@@ -4,6 +4,7 @@
  */
 
 const CLAUDE_MODELS = [
+  { value: 'claude-fabel-5', label: 'Claude fable 5' },
   { value: 'claude-opus-4-8', label: 'Claude Opus 4.8' },
   { value: 'claude-opus-4-7', label: 'Claude Opus 4.7' },
   { value: 'claude-sonnet-4-6-thinking', label: 'Claude Sonnet 4.6 Thinking' },
