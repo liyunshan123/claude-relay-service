@@ -41,7 +41,8 @@ function isProAccount(info) {
 
 class ClaudeAccountService {
   constructor() {
-    this.claudeApiUrl = 'https://console.anthropic.com/v1/oauth/token'
+    // console.anthropic.com 已迁移至 platform.claude.com，旧域名对 refresh_token grant 返回 404
+    this.claudeApiUrl = 'https://platform.claude.com/v1/oauth/token'
     this.claudeOauthClientId = '9d1c250a-e61b-44d9-88ed-5944d1962f5e'
     let maxWarnings = parseInt(process.env.CLAUDE_5H_WARNING_MAX_NOTIFICATIONS || '', 10)
 
@@ -549,13 +550,19 @@ class ClaudeAccountService {
       // 处理返回数据，移除敏感信息并添加限流状态和会话窗口信息
       const processedAccounts = await Promise.all(
         accounts.map(async (account) => {
-          const [rateLimitInfo, sessionWindowInfo, opusRateLimitStatus, isOverloaded] =
-            await Promise.all([
-              this.getAccountRateLimitInfo(account.id),
-              this.getSessionWindowInfo(account.id),
-              this.getAccountOpusRateLimitInfo(account.id, account),
-              this.isAccountOverloaded(account.id)
-            ])
+          const [
+            rateLimitInfo,
+            sessionWindowInfo,
+            opusRateLimitStatus,
+            fableRateLimitStatus,
+            isOverloaded
+          ] = await Promise.all([
+            this.getAccountRateLimitInfo(account.id),
+            this.getSessionWindowInfo(account.id),
+            this.getAccountOpusRateLimitInfo(account.id, account),
+            this.getAccountFableRateLimitInfo(account.id, account),
+            this.isAccountOverloaded(account.id)
+          ])
 
           // 构建 Claude Usage 快照（从 Redis 读取）
           const claudeUsage = this.buildClaudeUsageSnapshot(account)
@@ -615,6 +622,8 @@ class ClaudeAccountService {
               : null,
             // Opus 专属限流状态（仅影响 Opus 模型路由）
             opusRateLimitStatus,
+            // Fable 专属限流状态（仅影响 Fable 模型路由）
+            fableRateLimitStatus,
             // 过载状态（429/529 自动保护）
             overloadStatus: {
               isOverloaded,
@@ -1420,6 +1429,18 @@ class ClaudeAccountService {
         return { success: true, skipped: true }
       }
 
+      // 无上游权威 reset 时间的 429 大概率不是真实限流（如 overage、org_level_disabled、extra usage），
+      // 不标记账号限流，直接透传错误给客户端（与 sub2api 对 Anthropic 平台无 reset 头 429 的处理一致）
+      if (!rateLimitResetTimestamp) {
+        logger.warn(
+          `⚠️ 429 without authoritative reset header for account ${accountData.name} (${accountId}), skipping rate limit marking`
+        )
+        upstreamErrorHelper
+          .recordErrorHistory(accountId, 'claude-official', 429, 'rate_limit')
+          .catch(() => {})
+        return { success: true, skipped: true }
+      }
+
       // 设置限流状态和时间
       const updatedAccountData = { ...accountData }
       updatedAccountData.rateLimitedAt = new Date().toISOString()
@@ -1429,45 +1450,20 @@ class ClaudeAccountService {
       // 使用独立的限流自动停止标记，避免与其他自动停止冲突
       updatedAccountData.rateLimitAutoStopped = 'true'
 
-      // 如果提供了准确的限流重置时间戳（来自API响应头）
-      if (rateLimitResetTimestamp) {
-        // 将Unix时间戳（秒）转换为毫秒并创建Date对象
-        const resetTime = new Date(rateLimitResetTimestamp * 1000)
-        updatedAccountData.rateLimitEndAt = resetTime.toISOString()
+      // 将Unix时间戳（秒）转换为毫秒并创建Date对象
+      const resetTime = new Date(rateLimitResetTimestamp * 1000)
+      updatedAccountData.rateLimitEndAt = resetTime.toISOString()
 
-        // 计算当前会话窗口的开始时间（重置时间减去5小时）
-        const windowStartTime = new Date(resetTime.getTime() - 5 * 60 * 60 * 1000)
-        updatedAccountData.sessionWindowStart = windowStartTime.toISOString()
-        updatedAccountData.sessionWindowEnd = resetTime.toISOString()
+      // 计算当前会话窗口的开始时间（重置时间减去5小时）
+      const windowStartTime = new Date(resetTime.getTime() - 5 * 60 * 60 * 1000)
+      updatedAccountData.sessionWindowStart = windowStartTime.toISOString()
+      updatedAccountData.sessionWindowEnd = resetTime.toISOString()
 
-        const now = new Date()
-        const minutesUntilEnd = Math.ceil((resetTime - now) / (1000 * 60))
-        logger.warn(
-          `🚫 Account marked as rate limited with accurate reset time: ${accountData.name} (${accountId}) - ${minutesUntilEnd} minutes remaining until ${resetTime.toISOString()}`
-        )
-      } else {
-        // 获取或创建会话窗口（预估方式）
-        const windowData = await this.updateSessionWindow(accountId, updatedAccountData)
-        Object.assign(updatedAccountData, windowData)
-
-        // 限流结束时间 = 会话窗口结束时间
-        if (updatedAccountData.sessionWindowEnd) {
-          updatedAccountData.rateLimitEndAt = updatedAccountData.sessionWindowEnd
-          const windowEnd = new Date(updatedAccountData.sessionWindowEnd)
-          const now = new Date()
-          const minutesUntilEnd = Math.ceil((windowEnd - now) / (1000 * 60))
-          logger.warn(
-            `🚫 Account marked as rate limited until estimated session window ends: ${accountData.name} (${accountId}) - ${minutesUntilEnd} minutes remaining`
-          )
-        } else {
-          // 如果没有会话窗口，使用默认1小时（兼容旧逻辑）
-          const oneHourLater = new Date(Date.now() + 60 * 60 * 1000)
-          updatedAccountData.rateLimitEndAt = oneHourLater.toISOString()
-          logger.warn(
-            `🚫 Account marked as rate limited (1 hour default): ${accountData.name} (${accountId})`
-          )
-        }
-      }
+      const now = new Date()
+      const minutesUntilEnd = Math.ceil((resetTime - now) / (1000 * 60))
+      logger.warn(
+        `🚫 Account marked as rate limited with accurate reset time: ${accountData.name} (${accountId}) - ${minutesUntilEnd} minutes remaining until ${resetTime.toISOString()}`
+      )
 
       await redis.setClaudeAccount(accountId, updatedAccountData)
 
@@ -1486,7 +1482,7 @@ class ClaudeAccountService {
           platform: 'claude-oauth',
           status: 'error',
           errorCode: 'CLAUDE_OAUTH_RATE_LIMITED',
-          reason: `Account rate limited (429 error). ${rateLimitResetTimestamp ? `Reset at: ${formatDateWithTimezone(rateLimitResetTimestamp)}` : 'Estimated reset in 1-5 hours'}`,
+          reason: `Account rate limited (429 error). Reset at: ${formatDateWithTimezone(rateLimitResetTimestamp)}`,
           timestamp: getISOStringWithTimezone(new Date())
         })
       } catch (webhookError) {
@@ -1663,6 +1659,173 @@ class ClaudeAccountService {
       return { success: true }
     } catch (error) {
       logger.error(`❌ Failed to clear expired Opus rate limit for account: ${accountId}`, error)
+      throw error
+    }
+  }
+
+  // 🚫 标记账号的 Fable 限流状态（不影响其他模型调度）
+  async markAccountFableRateLimited(accountId, rateLimitResetTimestamp = null) {
+    try {
+      const accountData = await redis.getClaudeAccount(accountId)
+      if (!accountData || Object.keys(accountData).length === 0) {
+        throw new Error('Account not found')
+      }
+
+      const updatedAccountData = { ...accountData }
+      const now = new Date()
+      updatedAccountData.fableRateLimitedAt = now.toISOString()
+
+      if (rateLimitResetTimestamp) {
+        const resetTime = new Date(rateLimitResetTimestamp * 1000)
+        updatedAccountData.fableRateLimitEndAt = resetTime.toISOString()
+        logger.warn(
+          `🚫 Account ${accountData.name} (${accountId}) reached Fable weekly cap, resets at ${resetTime.toISOString()}`
+        )
+      } else {
+        // 如果缺少准确时间戳，保留现有值但记录警告，便于后续人工干预
+        logger.warn(
+          `⚠️ Account ${accountData.name} (${accountId}) reported Fable limit without reset timestamp`
+        )
+      }
+
+      await redis.setClaudeAccount(accountId, updatedAccountData)
+      return { success: true }
+    } catch (error) {
+      logger.error(`❌ Failed to mark Fable rate limit for account: ${accountId}`, error)
+      throw error
+    }
+  }
+
+  // ✅ 清除账号的 Fable 限流状态
+  async clearAccountFableRateLimit(accountId) {
+    try {
+      const accountData = await redis.getClaudeAccount(accountId)
+      if (!accountData || Object.keys(accountData).length === 0) {
+        return { success: true }
+      }
+
+      const updatedAccountData = { ...accountData }
+      delete updatedAccountData.fableRateLimitedAt
+      delete updatedAccountData.fableRateLimitEndAt
+
+      await redis.setClaudeAccount(accountId, updatedAccountData)
+
+      const redisKey = `claude:account:${accountId}`
+      if (redis.client && typeof redis.client.hdel === 'function') {
+        await redis.client.hdel(redisKey, 'fableRateLimitedAt', 'fableRateLimitEndAt')
+      }
+
+      logger.info(`✅ Cleared Fable rate limit state for account ${accountId}`)
+      return { success: true }
+    } catch (error) {
+      logger.error(`❌ Failed to clear Fable rate limit for account: ${accountId}`, error)
+      throw error
+    }
+  }
+
+  // 📊 获取账号 Fable 限流信息（自动清理过期状态）
+  async getAccountFableRateLimitInfo(accountId, accountData = null) {
+    try {
+      const data = accountData || (await redis.getClaudeAccount(accountId))
+      if (!data || Object.keys(data).length === 0 || !data.fableRateLimitEndAt) {
+        return {
+          isRateLimited: false,
+          rateLimitedAt: null,
+          resetAt: null,
+          minutesRemaining: 0
+        }
+      }
+
+      const resetAtMs = Date.parse(data.fableRateLimitEndAt)
+      if (Number.isNaN(resetAtMs)) {
+        return {
+          isRateLimited: false,
+          rateLimitedAt: data.fableRateLimitedAt || null,
+          resetAt: null,
+          minutesRemaining: 0
+        }
+      }
+
+      const nowMs = Date.now()
+      if (nowMs >= resetAtMs) {
+        // 自动清理过期标记，避免前端持续显示陈旧状态
+        await this.clearAccountFableRateLimit(accountId).catch(() => {})
+        return {
+          isRateLimited: false,
+          rateLimitedAt: data.fableRateLimitedAt || null,
+          resetAt: data.fableRateLimitEndAt,
+          minutesRemaining: 0
+        }
+      }
+
+      return {
+        isRateLimited: true,
+        rateLimitedAt: data.fableRateLimitedAt || null,
+        resetAt: data.fableRateLimitEndAt,
+        minutesRemaining: Math.max(0, Math.ceil((resetAtMs - nowMs) / (1000 * 60)))
+      }
+    } catch (error) {
+      logger.error(`❌ Failed to get Fable rate limit info for account: ${accountId}`, error)
+      return {
+        isRateLimited: false,
+        rateLimitedAt: null,
+        resetAt: null,
+        minutesRemaining: 0
+      }
+    }
+  }
+
+  // 🔍 检查账号是否处于 Fable 限流状态（自动清理过期标记）
+  async isAccountFableRateLimited(accountId) {
+    try {
+      const accountData = await redis.getClaudeAccount(accountId)
+      if (!accountData || Object.keys(accountData).length === 0) {
+        return false
+      }
+
+      if (!accountData.fableRateLimitEndAt) {
+        return false
+      }
+
+      const resetTime = new Date(accountData.fableRateLimitEndAt)
+      if (Number.isNaN(resetTime.getTime())) {
+        await this.clearAccountFableRateLimit(accountId)
+        return false
+      }
+
+      const now = new Date()
+      if (now >= resetTime) {
+        await this.clearAccountFableRateLimit(accountId)
+        return false
+      }
+
+      return true
+    } catch (error) {
+      logger.error(`❌ Failed to check Fable rate limit status for account: ${accountId}`, error)
+      return false
+    }
+  }
+
+  // ♻️ 检查并清理已过期的 Fable 限流标记
+  async clearExpiredFableRateLimit(accountId) {
+    try {
+      const accountData = await redis.getClaudeAccount(accountId)
+      if (!accountData || Object.keys(accountData).length === 0) {
+        return { success: true }
+      }
+
+      if (!accountData.fableRateLimitEndAt) {
+        return { success: true }
+      }
+
+      const resetTime = new Date(accountData.fableRateLimitEndAt)
+      if (Number.isNaN(resetTime.getTime()) || new Date() >= resetTime) {
+        await this.clearAccountFableRateLimit(accountId)
+      }
+
+      return { success: true }
+    } catch (error) {
+      logger.error(`❌ Failed to clear expired Fable rate limit for account: ${accountId}`, error)
       throw error
     }
   }
@@ -2622,6 +2785,8 @@ class ClaudeAccountService {
       delete updatedAccountData.sessionWindowEnd
       delete updatedAccountData.opusRateLimitedAt
       delete updatedAccountData.opusRateLimitEndAt
+      delete updatedAccountData.fableRateLimitedAt
+      delete updatedAccountData.fableRateLimitEndAt
       delete updatedAccountData.lastOverloadAt
 
       // 保存更新后的账户数据
@@ -2640,6 +2805,8 @@ class ClaudeAccountService {
         'sessionWindowEnd',
         'opusRateLimitedAt',
         'opusRateLimitEndAt',
+        'fableRateLimitedAt',
+        'fableRateLimitEndAt',
         'lastOverloadAt',
         // 新的独立标记
         'rateLimitAutoStopped',
